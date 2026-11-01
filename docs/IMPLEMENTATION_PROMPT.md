@@ -213,7 +213,7 @@ export interface StrategyHit {
   notes?: string[];            // human-readable reasons ("SMA50 rising 5d", "Lower BB 0.6% from SMA50")
 }
 
-export interface Overlay =
+export type Overlay =
   | { type: "line"; id: string; label: string; data: { time: string; value: number }[] }
   | { type: "band"; id: string; label: string; upper: ...; lower: ... }
   | { type: "box";  id: string; label: string; from: string; to: string; top: number; bottom: number }
