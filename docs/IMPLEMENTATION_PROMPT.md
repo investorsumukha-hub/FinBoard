@@ -33,8 +33,8 @@ Money
   └─ Liabilities                 loans, credit cards, EMIs
 Investments
   ├─ Overview                    allocation + returns across all asset classes
-  ├─ Stocks                      Zerodha tradebook / holdings import
-  ├─ Mutual Funds                Zerodha Coin import + AMFI NAVs
+  ├─ Stocks                      synced from broker APIs (Zerodha first), file import as fallback
+  ├─ Mutual Funds                synced from broker APIs (Zerodha Coin) + AMFI NAVs
   ├─ Fixed Income                FD, RD, PPF, EPF, NPS, bonds
   └─ Other Assets                gold/SGB, real estate, crypto, misc
 Trading Journal
@@ -56,8 +56,10 @@ Planning (phase 9)
   ├─ Goals
   ├─ Tax (capital gains)
   └─ Insurance
-Settings                         data paths, EOD update, imports, categories, preferences
+Settings                         data paths, EOD update, broker connections, imports, categories, preferences
 ```
+
+**Broker connections** (Settings → Connections) pull holdings, positions, trades, orders, funds and MF data directly from broker APIs. Zerodha Kite Connect is the first connector, and the design is broker-agnostic (§8A).
 
 A global **"Update EOD"** button (top bar) runs the owner's existing update script, streams its output, then re-runs all strategy scans.
 
@@ -76,6 +78,7 @@ Collect and record the answers in `docs/DATA_CONTRACT.md` (create it). This docu
 7. **Existing strategy**: its source file, exact rules, parameters and output format. It will be **ported** to a FinBoard strategy module (section 6) and verified for parity (section 11).
 8. **Corporate actions**: does the owner's data already adjust for splits/bonuses? If not, is there a corporate-actions file? (If neither, implement adjustment as a pluggable step and leave it disabled with a visible warning.)
 9. Ask for **one or two sample files** of each kind (EOD stock file, index file, Screener export, Zerodha tradebook, Zerodha holdings, a bank statement CSV) and place anonymised copies under `test/fixtures/` for parser tests.
+10. **Broker API access** (needed before Phase 5): confirm the owner has created a Kite Connect app, which plan it is on, and that the redirect URL in §8A.5 is registered. Never ask the owner to paste the API secret into chat or commit it — they enter it in the Connections UI. For connector tests, record **anonymised** API responses as fixtures (`test/fixtures/brokers/zerodha/*.json`); never commit real tokens, client IDs or account numbers.
 
 Do **not** build NSE downloaders/backfill in v1 — the owner's script owns data acquisition. Design the `MarketStore` so an NSE-fetching adapter could be added later without touching consumers.
 
@@ -166,7 +169,16 @@ export default defineConfig({
         },
       ],
     },
-    { id: "settings", title: "Settings", icon: "Settings", page: "settings" },
+    {
+      id: "settings", title: "Settings", icon: "Settings", page: "settings",
+      children: [
+        { id: "connections", title: "Connections", page: "settings/connections" },
+        // data, fundamentals, categories, preferences ...
+      ],
+    },
+  ],
+  brokers: [                                   // §8A — one entry per broker connector
+    { id: "zerodha", connector: () => import("@/modules/brokers/zerodha") },
   ],
 });
 ```
@@ -295,11 +307,12 @@ interface EodUpdater { run(onLog: (line: string) => void, signal: AbortSignal): 
 ### 5.3 Update flow
 
 1. User clicks **Update EOD** (top bar; also on Settings and Technical dashboard).
-2. `POST /api/eod/update` starts a job; `GET /api/eod/update/stream` is an **SSE** stream of `{ phase: "script" | "scan" | "snapshot", line?, progress?, done?, error? }`.
+2. `POST /api/eod/update` starts a job; `GET /api/eod/update/stream` is an **SSE** stream of `{ phase: "script" | "scan" | "broker-sync" | "snapshot", line?, progress?, done?, error? }`.
 3. Phase `script`: run `ScriptEodUpdater`. If it fails, stop and show the tail of the log.
 4. Phase `scan`: invalidate caches, compute shared precomputations (RS ratings, index series) once, then run **every strategy found in the config** over the universe → `SignalStore.write(lastDate, ...)`. Show per-strategy progress and hit counts. Parallelise over symbols with a bounded worker pool (`p-limit`); total should finish in seconds-to-a-minute for ~2,000 symbols.
-5. Phase `snapshot`: write a net-worth snapshot (section 8) and refresh mutual-fund NAVs (AMFI `NAVAll.txt`, public; tolerate failure).
-6. UI shows "Last updated: <date>, <time> IST" from the latest signals file.
+5. Phase `broker-sync`: run the broker sync engine (§8A.4) for every connection with a valid session; expired connections are skipped with a "Reconnect" notice (never fail the whole update).
+6. Phase `snapshot`: write a net-worth snapshot (section 8) and refresh mutual-fund NAVs (AMFI `NAVAll.txt`, public; tolerate failure).
+7. UI shows "Last updated: <date>, <time> IST" from the latest signals file.
 
 Also expose the same flow as CLI: `npm run eod:update` (script + scan + snapshot) and `npm run scan [-- --date YYYY-MM-DD --strategy abc]` (scan only).
 
@@ -435,7 +448,7 @@ cash_transactions(id, account_id, date, amount_paise, direction[in|out], categor
 budgets(id, category_id, month, amount_paise)
 liabilities(id, account_id, type[home|car|personal|education|gold|credit_card|other], lender, principal_paise, rate_pct, tenure_months, emi_paise, start_date, emi_day, notes)
 instruments(id, asset_class[equity|mf|etf|fd|rd|ppf|epf|nps|bond|gold|sgb|real_estate|crypto|other], symbol, isin, scheme_code, name)
-investment_txns(id, instrument_id, account_id, date, type[BUY|SELL|DIVIDEND|INTEREST|SPLIT|BONUS|DEPOSIT|WITHDRAWAL], quantity, price, amount_paise, fees_paise, source[zerodha|manual|...], external_id, import_batch_id, UNIQUE(source, external_id))
+investment_txns(id, instrument_id, account_id, connection_id NULL, date, traded_at, type[BUY|SELL|DIVIDEND|INTEREST|SPLIT|BONUS|DEPOSIT|WITHDRAWAL], quantity, price, amount_paise, fees_paise, fees_estimated bool, origin[api|file|manual], external_id, dedupe_hash, import_batch_id, UNIQUE(connection_id, external_id))
 asset_valuations(id, instrument_id, date, value_paise)          -- for FD/PPF/EPF/NPS/real estate/other manual marks
 fixed_deposits(id, instrument_id, principal_paise, rate_pct, compounding, start_date, maturity_date, payout)
 trades(id, symbol, side[LONG|SHORT], entry_date, entry_price, exit_date, exit_price, quantity, stop_loss, target, fees_paise, setup (strategy id or free text), emotion, rating, notes, screenshot_path, status[planned|open|closed], source_trade_ids[])
@@ -446,15 +459,22 @@ valuation_runs(id, symbol, model_id, inputs jsonb, fair_value, created_at)
 net_worth_snapshots(date PK, assets_paise, liabilities_paise, breakdown jsonb)
 goals(id, name, target_paise, target_date, linked_instrument_ids[], priority)
 insurance_policies(id, type, insurer, policy_no, sum_assured_paise, premium_paise, frequency, next_due, nominee, notes)
-import_batches(id, kind, filename, imported_at, rows, status)
+import_batches(id, kind, connection_id, importer_id, filename, imported_at, rows, status)
 settings(key PK, value jsonb)
+
+-- broker connectors (§8A)
+broker_connections(id, broker_id, label, client_id, account_id → accounts, status[connected|expired|error|disconnected], credentials_enc, session_enc, session_expires_at, last_sync_at, created_at)
+broker_sync_runs(id, connection_id, trigger[manual|login|eod|cli], started_at, finished_at, status, counts jsonb, error)
+broker_sync_coverage(connection_id, kind, date, PRIMARY KEY(connection_id, kind, date))
+broker_raw_records(id, connection_id, kind, external_id, payload jsonb, fetched_at, UNIQUE(connection_id, kind, external_id))
+broker_holdings_snapshots(connection_id, date, isin, symbol, quantity, average_price, last_price, kind[equity|mf], PRIMARY KEY(connection_id, date, isin))
 ```
 
-### 8.2 Zerodha imports (verify columns against fixtures; header-name based, not positional)
-- **Console tradebook CSV** (Equity and Coin/MF segments). Expected headers: `symbol, isin, trade_date, exchange, segment, series, trade_type, auction, quantity, price, trade_id, order_id, order_execution_time`. Upsert into `investment_txns` deduped on `trade_id` (fall back to `order_id + time + qty + price` hash). Import preview → confirm → summary.
-- **Trade matching** into `trades` (journal): FIFO per symbol; intraday (same-day buy/sell) and swing round-trips become closed trades; open quantities become open trades. Re-running import must not duplicate trades; manual notes/tags on existing trades are preserved.
-- **Console holdings CSV** (Symbol, ISIN, Sector, Quantity Available, …, Average Price, Previous Closing Price, Unrealized P&L): **reconciliation report** comparing derived holdings to broker holdings (qty and avg price diffs), with an option to create an adjusting entry.
-- Corporate actions (splits/bonuses) for holdings: manual entry form in v1.
+### 8.2 Broker data
+Broker data (holdings, positions, trades, orders, funds, MF holdings) comes from **broker connectors** — see **§8A**. There is no Zerodha-specific code outside `src/modules/brokers/zerodha/`. Everything downstream (holdings, XIRR, journal, reconciliation, dashboards) consumes only the **canonical broker models** defined in §8A.2.
+- **Trade matching** into `trades` (journal): FIFO per (connection, symbol); intraday (same-day buy/sell) and swing round-trips become closed trades; open quantities become open trades. Re-running a sync/import must not duplicate trades; manual notes/tags on existing trades are preserved.
+- **Reconciliation**: after every sync, compare holdings derived from `investment_txns` with the broker's own holdings snapshot (qty and avg price per ISIN). Show differences with likely causes (missing trade days, corporate action, off-market transfer, IPO allotment) and actions ("import tradebook for <date range>", "add corporate action", "create adjusting entry").
+- Corporate actions (splits/bonuses) for holdings: manual entry form in v1; suggest them automatically when reconciliation shows an integer-ratio quantity change.
 
 ### 8.3 Money features
 - Accounts list with computed balances; transfers between accounts (two linked rows).
@@ -482,11 +502,141 @@ Goals (required monthly SIP via FV of annuity at an assumed return; progress fro
 
 ---
 
+## 8A. Broker connectors (platform-agnostic, API-first)
+
+Goal: fetch portfolio data **directly from broker APIs** (Zerodha Kite Connect first), with a design where adding another broker (Upstox, Groww, Angel One, Dhan, Fyers, ICICI Direct, …) is **one module folder + one config entry**, exactly like strategies.
+
+### 8A.1 Principles
+1. **Read-only.** FinBoard never places, modifies or cancels orders. Connector interfaces have no write methods, and each connector's HTTP client enforces an allow-list of endpoints (GET data endpoints + the session token exchange/logout only). A test asserts this.
+2. **Canonical models only downstream.** Connectors translate broker payloads into the canonical types below; nothing outside a connector folder knows broker field names.
+3. **API first, files as fallback.** A connector may declare file importers (e.g. Zerodha Console tradebook) for history the API cannot provide. API data and file data flow through the same canonical pipeline and dedupe against each other.
+4. **Multiple connections per broker** (e.g. own + spouse's Zerodha accounts); every record is tagged with `connection_id`.
+5. **Instrument identity by ISIN**, mapped to the NSE symbol used by the market store; broker trading symbols (e.g. `-BE` suffixes) are kept only as metadata.
+6. **Secrets never leave the server**, are encrypted at rest, and are never logged.
+
+### 8A.2 Contract (`src/core/broker/define.ts`)
+
+```ts
+// ---- canonical models ----
+type Segment = "EQ" | "MF" | "FO" | "CDS" | "COM";
+interface CanonicalTrade {
+  externalId: string;            // broker trade id (unique per connection)
+  orderId?: string;
+  isin?: string; brokerSymbol: string; exchange: "NSE" | "BSE" | string; segment: Segment;
+  side: "BUY" | "SELL"; quantity: number; price: number;
+  tradedAt: string;              // ISO, IST
+  product?: "CNC" | "MIS" | "NRML" | "MTF" | string;
+  charges?: { brokerage?: number; stt?: number; exchange?: number; gst?: number; sebi?: number; stamp?: number };
+  raw?: unknown;                 // stored in broker_raw_records, never used downstream
+}
+interface CanonicalHolding { isin: string; brokerSymbol: string; exchange: string; quantity: number; t1Quantity?: number; pledgedQuantity?: number; averagePrice: number; lastPrice?: number; asOf: string; }
+interface CanonicalPosition { brokerSymbol: string; exchange: string; product: string; quantity: number; averagePrice: number; pnl?: number; asOf: string; }
+interface CanonicalOrder { externalId: string; status: string; side: "BUY" | "SELL"; brokerSymbol: string; quantity: number; filledQuantity: number; price?: number; averagePrice?: number; placedAt: string; tag?: string; }
+interface CanonicalFunds { available: number; used: number; total: number; asOf: string; }
+interface CanonicalMfHolding { isin: string; schemeName: string; folio?: string; units: number; averageNav: number; lastNav?: number; asOf: string; }
+interface CanonicalMfTxn { externalId: string; isin: string; side: "BUY" | "SELL"; units: number; nav: number; amount: number; date: string; }
+
+// ---- connector ----
+type AuthKind = "oauth-redirect" | "api-key-totp" | "api-key" | "file-only";
+
+export function defineBroker<C extends z.ZodObject<any>>(b: {
+  id: string;                          // "zerodha"
+  name: string;                        // "Zerodha"
+  credentials: C;                      // Zod schema for user-entered creds (e.g. apiKey, apiSecret) → rendered as a form
+  auth: {
+    kind: AuthKind;
+    sessionTtl: "daily" | "long-lived" | { hours: number };      // drives "reconnect" banners
+    begin?(ctx: AuthCtx<C>): Promise<{ redirectUrl: string }>;  // oauth-redirect
+    complete?(ctx: AuthCtx<C>, query: URLSearchParams): Promise<Session>;
+    login?(ctx: AuthCtx<C>, input: { totp?: string }): Promise<Session>; // api-key-totp
+    logout?(ctx: AuthCtx<C>, s: Session): Promise<void>;
+  };
+  capabilities: {
+    holdings?: true; positions?: true; funds?: true; orders?: true;
+    trades?: { history: "today" | { maxDays: number } | "unlimited" };
+    mfHoldings?: true; mfTransactions?: { history: "today" | { maxDays: number } | "unlimited" };
+  };
+  fetch: {                             // implement exactly the declared capabilities
+    profile(s: Session): Promise<{ clientId: string; name?: string; email?: string }>;
+    holdings?(s: Session): Promise<CanonicalHolding[]>;
+    positions?(s: Session): Promise<CanonicalPosition[]>;
+    funds?(s: Session): Promise<CanonicalFunds>;
+    orders?(s: Session): Promise<CanonicalOrder[]>;
+    trades?(s: Session, range: { from: string; to: string }): Promise<CanonicalTrade[]>;
+    mfHoldings?(s: Session): Promise<CanonicalMfHolding[]>;
+    mfTransactions?(s: Session, range: { from: string; to: string }): Promise<CanonicalMfTxn[]>;
+  };
+  importers?: Array<{                  // file fallbacks, same canonical output
+    id: string; label: string; accept: string[];                 // e.g. [".csv", ".xlsx"]
+    produces: "trades" | "holdings" | "mfTransactions" | "mfHoldings";
+    detect(headers: string[]): boolean;                          // auto-detect file type on upload
+    parse(file: Buffer, filename: string): Promise<CanonicalTrade[] | CanonicalHolding[] | CanonicalMfTxn[] | CanonicalMfHolding[]>;
+  }>;
+  rateLimit?: { perSecond: number };
+  docsUrl?: string;                    // shown on the connection setup screen
+}): BrokerConnector<C>;
+```
+
+A conformance test suite (`src/core/broker/conformance.ts`) runs against every connector found in the config using recorded fixtures: declared capabilities are implemented, outputs validate against canonical Zod schemas, `externalId`s are stable across repeated fetches, and the endpoint allow-list contains no order-placement routes.
+
+### 8A.3 Wiring through config
+
+```ts
+// finboard.config.ts
+brokers: [
+  { id: "zerodha", connector: () => import("@/modules/brokers/zerodha") },
+  // { id: "upstox", connector: () => import("@/modules/brokers/upstox") },
+],
+```
+Settings → **Connections** lists available brokers from this array and the user's connections; Investments, the journal and the sync engine iterate over connections generically.
+
+### 8A.4 Sync engine (`src/core/broker/sync.ts`) — broker-agnostic
+For each connection with a valid session, and for each declared capability:
+1. Fetch (respecting `rateLimit`, retry with backoff on 429/5xx; on auth errors mark the connection `expired` and stop).
+2. Validate against canonical schemas; store raw payloads in `broker_raw_records` (upsert on `(connection_id, kind, external_id)`), for audit and re-processing.
+3. Normalise: trades/MF txns → `investment_txns` (upsert on `(connection_id, external_id)`; also dedupe API vs file-import rows by `trade_id`, falling back to a hash of `isin + tradedAt + side + qty + price`); holdings/MF holdings → `broker_holdings_snapshots` (one per connection per day); funds → cash balance of the linked demat/trading `account`.
+4. Re-run trade matching (journal) and reconciliation (§8.2) for affected symbols.
+5. Record a `broker_sync_runs` row with counts and errors.
+6. **Gap tracking**: maintain `broker_sync_coverage(connection_id, kind, date)`. If the connector's trade history is `"today"` and a trading day has no coverage, flag it in the UI ("Trades for 3 Nov were not synced — import a tradebook for that range"), and let the matching file importer fill it.
+
+Triggers: "Sync now" (per connection or all), automatically right after a successful login callback, and as a `broker-sync` phase in the Update EOD flow (§5.3; skipped with a notice if the session is expired). CLI: `npm run broker:sync [-- --connection <id>]`.
+
+### 8A.5 Zerodha connector (`src/modules/brokers/zerodha/`) — first implementation
+**Verify every detail below against the current Kite Connect v3 docs (https://kite.trade/docs/connect/v3/) and the developer console before coding; the docs win if anything differs.**
+- **App setup (owner does once)**: create an app at developers.kite.trade. A personal-use plan with no market-data access is enough, because FinBoard only needs portfolio/order data (prices come from the owner's EOD files). Register the redirect URL `http://127.0.0.1:3000/api/brokers/zerodha/callback` (v2: the Vercel HTTPS URL). The owner enters `apiKey` and `apiSecret` in Settings → Connections; they're stored encrypted (§8A.6).
+- **Auth (`oauth-redirect`, `sessionTtl: "daily"`)**: `begin` → `https://kite.zerodha.com/connect/login?v=3&api_key=<apiKey>`; callback receives `request_token` (+ `status=success`); `complete` → `POST https://api.kite.trade/session/token` with `api_key`, `request_token`, `checksum = SHA-256(api_key + request_token + api_secret)` → `access_token`. Requests use headers `X-Kite-Version: 3` and `Authorization: token <api_key>:<access_token>`. The token expires daily (early morning, next day) and has no refresh token, so the UI shows a one-click **"Reconnect Zerodha"** banner when expired. Verify the `state`/redirect params to prevent CSRF (store a nonce in a short-lived signed cookie and pass it via the `redirect_params` option).
+- **Endpoints used (allow-list)**: `GET /user/profile`, `GET /user/margins`, `GET /portfolio/holdings`, `GET /portfolio/positions`, `GET /orders`, `GET /trades`, `GET /mf/holdings`, `GET /mf/orders`, plus `POST /session/token` and `DELETE /session/token`. Use a thin typed `fetch` client (Zod-validated responses); the official `kiteconnect` npm SDK is acceptable only if wrapped so the allow-list is still enforced.
+- **Capabilities**: holdings, positions, funds, orders, `trades: { history: "today" }`, mfHoldings, `mfTransactions: { history: { maxDays: <per docs> } }`. Note that `/orders` and `/trades` return **only the current trading day**, so daily syncs (via the Update EOD flow) build history going forward.
+- **History bootstrap and gap filling via importers** (same connector):
+  - `console-tradebook` — Zerodha Console tradebook CSV (Equity and MF segments). Expected headers: `symbol, isin, trade_date, exchange, segment, series, trade_type, auction, quantity, price, trade_id, order_id, order_execution_time` (header-name based, verify against fixture).
+  - `console-holdings` — Console holdings CSV (used as a reconciliation snapshot).
+  - `console-pnl` (optional) — tax P&L statement, used only to cross-check realised P&L.
+- **Charges**: Kite APIs don't return per-trade charges; estimate them with a configurable charge schedule (brokerage, STT, exchange txn, SEBI, stamp duty, GST) stored in settings, flagged as estimates; contract-note import can be added later.
+- **Rate limit**: stay well under Kite's documented per-second limits (`rateLimit: { perSecond: 3 }` default).
+
+### 8A.6 Security
+- Broker credentials and session tokens are stored in `broker_connections` encrypted with **AES-256-GCM** using `FINBOARD_ENCRYPTION_KEY` (32-byte, base64, from `.env.local`; startup fails with a clear message if missing while a connection exists). Rotating the key re-encrypts rows via `npm run secrets:rotate`.
+- Tokens are never sent to the client, never logged (central logger redacts known secret fields), and are deleted on "Disconnect" (also calling the broker's logout endpoint if available).
+- OAuth callbacks validate the CSRF nonce; callback routes reject requests when `AUTH_MODE=google` and the user isn't signed in.
+
+### 8A.7 UI
+- **Settings → Connections**: cards per connection (broker logo text, label, client id, status chip `connected | expired | error | disconnected`, session expiry time, last sync time + counts, coverage gaps), buttons Connect / Reconnect / Sync now / Disconnect / Import file. "Add connection" wizard: choose broker (from config) → enter credentials (form from the connector's Zod schema; shows the connector's setup notes + `docsUrl`, including the redirect URL to register) → authenticate → first sync → offer history bootstrap via file importer.
+- Global top-bar indicator when any connection is expired, with one-click reconnect.
+- Investments → Stocks / Mutual Funds: filter by connection; each holding shows "broker qty vs derived qty" badge when they differ.
+- Sync log page: recent `broker_sync_runs` with expandable errors.
+
+### 8A.8 Adding another broker (must be true when done; document in README)
+1. Create `src/modules/brokers/<id>/index.ts` exporting `defineBroker({...})` (plus any helper files and fixtures in that folder).
+2. Add `{ id: "<id>", connector: () => import("@/modules/brokers/<id>") }` to `brokers` in `finboard.config.ts`.
+The conformance suite then runs against it automatically; the Connections wizard, sync engine, holdings, journal and reconciliation work without other changes.
+
+---
+
 ## 9. UI / UX requirements
 
 - Layout: collapsible sidebar generated from the config (icons, nested groups, active state, breadcrumbs), top bar with global symbol search (universe + fundamentals + holdings), Update EOD button with status, theme toggle.
 - Indian formatting utilities in `src/lib/format.ts` (₹, lakh/crore compact formatting, `dd MMM yyyy` dates, IST). Green/red for gains/losses with colour-blind-safe alternative (also use ▲/▼).
-- Every page has loading skeletons, empty states with the next action ("Upload a Screener file", "Import your Zerodha tradebook", "Set FINBOARD_EOD_DIR"), and error states with actionable messages.
+- Every page has loading skeletons, empty states with the next action ("Upload a Screener file", "Connect your broker", "Set FINBOARD_EOD_DIR"), and error states with actionable messages.
 - Responsive down to 375 px width; tables scroll horizontally inside their container only.
 - Keyboard: `/` focuses search; `u` triggers update (with confirm).
 - A visible disclaimer on Research pages: signals and valuations are analytical tools, not investment advice.
@@ -509,14 +659,18 @@ AUTH_GOOGLE_ID=
 AUTH_GOOGLE_SECRET=
 ALLOWED_EMAIL=
 DATABASE_URL=                       # v2 Neon; empty → PGlite at $FINBOARD_DATA_DIR/db
+FINBOARD_ENCRYPTION_KEY=            # base64 32 bytes; encrypts broker credentials/tokens (generate: openssl rand -base64 32)
+FINBOARD_PUBLIC_URL=http://127.0.0.1:3000   # used to build broker OAuth redirect URLs
 ```
+Broker API keys/secrets are **not** env vars — they are entered per connection in Settings → Connections and stored encrypted, so multiple accounts and brokers work the same way.
 Validate env with Zod at startup (`src/env.ts`) and show a friendly setup screen if required paths are missing or unreadable.
 
 ---
 
 ## 11. Testing & quality gates
 
-- **Unit (Vitest)**: indicators (vs hand-computed fixtures), each strategy on synthetic series that should and should not trigger (≥ 2 positive and 2 negative cases each, including edge cases like insufficient lookback), look-ahead check (appending future bars must not change `scan` result on a truncated series), Screener parser (fixture), each valuation model (hand-worked example), XIRR, FIFO lot matching, Zerodha tradebook parsing/dedupe, bank import dedupe, config validation test (§4.2).
+- **Unit (Vitest)**: indicators (vs hand-computed fixtures), each strategy on synthetic series that should and should not trigger (≥ 2 positive and 2 negative cases each, including edge cases like insufficient lookback), look-ahead check (appending future bars must not change `scan` result on a truncated series), Screener parser (fixture), each valuation model (hand-worked example), XIRR, FIFO lot matching, bank import dedupe, config validation test (§4.2).
+- **Broker connectors**: conformance suite (§8A.2) for every configured connector using recorded fixtures (HTTP mocked with `msw` or `undici` MockAgent — no live broker calls in tests); Zerodha checksum/session exchange; endpoint allow-list (no order routes); API-vs-file dedupe (same trade imported both ways yields one row); sync idempotency (running sync twice changes nothing); expired-token handling marks the connection `expired`; coverage-gap detection; encryption round-trip and that secrets never appear in logs or client payloads.
 - **Parity test** for the owner's existing strategy: run the original script/logic and the port on the same fixture data; hit lists and key values must match exactly (document any intentional differences with the owner's approval).
 - **E2E smoke (Playwright)**: app boots with fixture data dir, sidebar renders from config, a strategy page lists hits, a fundamental page shows a fair value, Update EOD runs a fake script (fixture command) and streams logs.
 - **Extensibility test**: a test adds a dummy strategy node + module (in a temp config) and asserts it appears in the resolved nav, the technical dashboard card list, and the scan pipeline — without touching any other file.
@@ -530,7 +684,7 @@ Validate env with Zod at startup (`src/env.ts`) and show a friendly setup screen
 2. **Discovery + market data** — complete `docs/DATA_CONTRACT.md` with the owner; `LocalFileMarketStore` with configurable column mapping and caching; index loading; `ScriptEodUpdater` + SSE job API + Update EOD button with live log; symbol page with candle chart; CLI scripts. *Done when* the owner's real data loads and the button runs their script end-to-end.
 3. **Technical** — indicator library; `defineStrategy`; scan pipeline + RS rating + `SignalStore`; `StrategyPage` + chart drawer + presets; ABC, 44 MA, SEPA, VCP, Darvas, and the owner's strategy (with parity test); `TechnicalDashboard`; extensibility test. *Done when* a fresh scan over the full universe produces signals and every strategy page shows hits with overlays.
 4. **Fundamental** — Screener upload + parser + derived metrics; `defineValuationModel`; all models; `ApproachPage` ×3; `FundamentalDashboard` with football-field chart. *Done when* uploading a fixture file yields fair values in all three approaches.
-5. **Investments** — Zerodha tradebook/holdings import + reconciliation; FIFO holdings; XIRR; MF via AMFI; FD/PPF/EPF/NPS/other assets; Overview page.
+5. **Brokers + Investments** — `defineBroker` + canonical models + conformance suite; encryption; Connections UI and wizard; sync engine with coverage tracking; Zerodha connector (Kite Connect OAuth, holdings/positions/funds/orders/trades/MF) with Console file importers for history; `broker-sync` phase in Update EOD; reconciliation; FIFO holdings; XIRR; MF via AMFI; FD/PPF/EPF/NPS/other assets; Overview page. *Done when* the owner connects Zerodha, a sync populates holdings that reconcile with the broker snapshot, a one-time Console tradebook import back-fills history without duplicates, and a dummy second broker added via the two-step pattern passes the conformance suite.
 6. **Trading journal** — trade matching, journal CRUD, plan-from-strategy flow, analytics.
 7. **Money** — accounts, transactions, bank CSV mapping import, rules, budgets, liabilities + amortisation.
 8. **Home dashboard** — net-worth snapshots (also written by the update flow) and all widgets.
@@ -553,10 +707,10 @@ Validate env with Zod at startup (`src/env.ts`) and show a friendly setup screen
    ```
 2. Add `{ id: "my-strategy", title: "My Strategy", strategy: () => import("@/modules/technical/my-strategy") }` under the Technical node in `finboard.config.ts`.
 
-Result: new sidebar entry, page at `/research/technical/my-strategy`, card on the Technical dashboard, included in every scan. Same two-step pattern for valuation models (file in `src/modules/valuation/<approach>/` + entry in the approach's `models` array).
+Result: new sidebar entry, page at `/research/technical/my-strategy`, card on the Technical dashboard, included in every scan. Same two-step pattern for valuation models (file in `src/modules/valuation/<approach>/` + entry in the approach's `models` array) and for brokers (folder in `src/modules/brokers/<id>/` + entry in `brokers`, see §8A.8).
 
 ---
 
 ## 14. Out of scope for v1
 
-NSE data downloading/backfill (owner's script handles it), backtesting engine, live/intraday quotes, broker API (Kite Connect) integration, multi-user support, mobile app, notifications by email/push, cloud deployment. Keep the seams described in §5.4 so these can be added later.
+NSE data downloading/backfill (owner's script handles it), backtesting engine, live/intraday quotes, any order placement or trading through broker APIs (FinBoard is read-only), broker market-data/historical-candle APIs, broker postback webhooks (need a public URL; consider in v2), connectors other than Zerodha (the framework must support them), multi-user support, mobile app, notifications by email/push, cloud deployment. Keep the seams described in §5.4 so these can be added later.
