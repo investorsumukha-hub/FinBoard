@@ -10,8 +10,8 @@ You are building **FinBoard**, a personal, single-user, one-stop finance dashboa
 
 Ground rules:
 
-1. **Discovery first (section 2).** The owner already has EOD market data, an update script, and one strategy. You must inspect those before writing the data layer. If anything in section 2 cannot be answered from files in the repo or the data folder, **stop and ask the owner** — do not guess file formats.
-2. **Never modify, move, or delete the owner's existing data files or scripts.** FinBoard reads market data; only the owner's own script writes it. FinBoard may write only to its own folders (`signals/`, `cache/`, `db/`, `fundamentals/` uploads) under the configured data directory.
+1. **Discovery first (section 2).** The owner already has historical EOD market data and one strategy. **Their old update script no longer exists, so FinBoard has its own NSE EOD pipeline (§5.5).** You must inspect the existing data and strategy before writing the data layer. If anything in section 2 cannot be answered from files in the repo or the data folder, **stop and ask the owner**. Do not guess file formats.
+2. **Never modify, move, or delete the owner's existing (legacy) data files.** They are imported **once, read-only** into FinBoard's own canonical store (§5.5.2). From then on, FinBoard's NSE pipeline is the only writer, and it writes only to `FINBOARD_DATA_DIR` (`market/`, `signals/`, `cache/`, `db/`, `fundamentals/`).
 3. **Declarative architecture is the core requirement** (section 4). Adding a new technical strategy or valuation model must take exactly: **one entry in `finboard.config.ts` + one module file**. No edits to routing, navigation, dashboards, pipelines or registries. Treat any design that violates this as a bug.
 4. **v1 runs locally** (`npm run dev` / `npm run build && npm start` on the owner's machine). Code must still be structured so that v2 can deploy to **Vercel** by swapping storage adapters and flipping env flags — no Vercel-hostile assumptions outside the adapter layer (filesystem access, child processes and PGlite are confined to clearly named `local` adapters).
 5. Everything is **India-only**: NSE symbols, INR, Indian number formatting (`₹1,23,45,678.90`, lakhs/crores toggles), IST dates, Indian FY (Apr–Mar).
@@ -56,12 +56,12 @@ Planning (phase 9)
   ├─ Goals
   ├─ Tax (capital gains)
   └─ Insurance
-Settings                         data paths, EOD update, broker connections, imports, categories, preferences
+Settings                         market data (NSE pipeline, backfill, integrity), broker connections, imports, categories, preferences
 ```
 
 **Broker connections** (Settings → Connections) pull holdings, positions, trades, orders, funds and MF data directly from broker APIs. Zerodha Kite Connect is the first connector, and the design is broker-agnostic (§8A).
 
-A global **"Update EOD"** button (top bar) runs the owner's existing update script, streams its output, then re-runs all strategy scans.
+A global **"Update EOD"** button (top bar) runs FinBoard's built-in NSE EOD pipeline. It downloads every missing trading day's bhavcopy, index closes and corporate actions, appends them to per-stock CSV files, and streams progress. It then syncs brokers and re-runs all strategy scans.
 
 ---
 
@@ -69,18 +69,18 @@ A global **"Update EOD"** button (top bar) runs the owner's existing update scri
 
 Collect and record the answers in `docs/DATA_CONTRACT.md` (create it). This document becomes the contract the data adapters implement.
 
-1. **Data directory**: absolute path(s) of the owner's EOD data. Will be supplied via `.env.local` as `FINBOARD_EOD_DIR`. FinBoard's own writable folder is `FINBOARD_DATA_DIR` (may be the same parent).
-2. **File format** of the per-stock EOD files: CSV or Excel (`.xlsx`)? One file per symbol? Naming convention (e.g. `RELIANCE.csv`, `RELIANCE.NS.xlsx`)? Sheet name if Excel?
-3. **Columns**: exact header names, order, date format, number formats, whether delivery qty/% exists, whether prices are raw or already split/bonus-adjusted, sort order (ascending/descending), duplicate handling.
-4. **Index data**: is there Nifty 50 / Nifty 500 / sector index history? Where and in what format? (Needed for RS rating, beta and market-trend widgets; if missing, these features degrade gracefully and say so in the UI.)
-5. **Universe**: the strategy scan universe is **every stock that has a file in the owner's EOD data folder** (the stocks "represented in the Excel files"). Confirm this interpretation with the owner. Make the universe source pluggable (`universe: { source: "eod-files" | "list-file" | "fundamentals-files" }` in config) so it can change without code edits.
-6. **Update script**: path, language/runtime (e.g. `python update.py`), working directory, required env/venv, expected runtime, how it signals success/failure (exit code? log lines?), whether it is safe to run while FinBoard is reading files.
+1. **Legacy data directory**: absolute path of the owner's existing EOD data, supplied via `.env.local` as `FINBOARD_LEGACY_EOD_DIR` and used **only** by the one-time import (§5.5.2). FinBoard's own writable folder is `FINBOARD_DATA_DIR`.
+2. **Legacy file format** of the per-stock files: CSV or Excel (`.xlsx`)? One file per symbol? Naming convention (e.g. `RELIANCE.csv`, `RELIANCE.NS.xlsx`)? Sheet name if Excel?
+3. **Legacy columns**: exact header names, order, date format, number formats, whether delivery qty/% exists, sort order (ascending/descending), duplicate handling, and the **earliest and latest date** present. Also find out whether prices are **raw or already split/bonus-adjusted**. This is critical: the canonical store keeps **raw** prices, so adjusted legacy data must either be un-adjusted using corporate actions or replaced by a backfill from NSE archives (§5.5.5). Ask the owner which they prefer if this can't be determined from the data (e.g. compare a known split date against NSE bhavcopy).
+4. **Legacy index data**: is there Nifty 50 / Nifty 500 / sector index history? If not, the backfill fetches it from NSE index archives.
+5. **Universe**: the default strategy scan universe is **every stock that has a file in the owner's legacy data folder** (the stocks "represented in the Excel files"). The import writes this list to `market/meta/universe.txt`, and the owner can edit it in Settings. The pipeline still stores **all** NSE equity rows, so the universe can grow without another backfill. Confirm this with the owner. Make the universe source pluggable (`universe: { source: "list-file" | "all-eq" | "fundamentals-files" | "index:<name>" }` in config) so it can change without code edits.
+6. **Network check**: from the owner's machine, confirm that the NSE archive URLs in §5.5.3 respond (they change occasionally; NSE may block automated or cloud traffic). Record the working URL patterns and a sample of each file in `test/fixtures/nse/`.
 7. **Existing strategy**: its source file, exact rules, parameters and output format. It will be **ported** to a FinBoard strategy module (section 6) and verified for parity (section 11).
-8. **Corporate actions**: does the owner's data already adjust for splits/bonuses? If not, is there a corporate-actions file? (If neither, implement adjustment as a pluggable step and leave it disabled with a visible warning.)
+8. **Corporate actions**: whether the owner has any record of splits and bonuses for their legacy data. Otherwise FinBoard's own corporate-actions fetch (§5.5.3) is the source.
 9. Ask for **one or two sample files** of each kind (EOD stock file, index file, Screener export, Zerodha tradebook, Zerodha holdings, a bank statement CSV) and place anonymised copies under `test/fixtures/` for parser tests.
 10. **Broker API access** (needed before Phase 5): confirm the owner has created a Kite Connect app, which plan it is on, and that the redirect URL in §8A.5 is registered. Never ask the owner to paste the API secret into chat or commit it — they enter it in the Connections UI. For connector tests, record **anonymised** API responses as fixtures (`test/fixtures/brokers/zerodha/*.json`); never commit real tokens, client IDs or account numbers.
 
-Do **not** build NSE downloaders/backfill in v1 — the owner's script owns data acquisition. Design the `MarketStore` so an NSE-fetching adapter could be added later without touching consumers.
+FinBoard **owns data acquisition** through its NSE EOD pipeline (§5.5): legacy import, incremental daily update and historical backfill. Keep the data source behind an `EodSource` interface so another source (e.g. BSE, or a paid vendor) can be added later without touching consumers.
 
 ---
 
@@ -96,6 +96,7 @@ Do **not** build NSE downloaders/backfill in v1 — the owner's script owns data
 | Personal DB | **Drizzle ORM** with **PGlite** (`drizzle-orm/pglite`) in v1, **Neon** (`drizzle-orm/neon-http`) in v2 | One Postgres schema for both. Add `@electric-sql/pglite` to `serverExternalPackages` in `next.config` |
 | Excel | SheetJS (`xlsx`, installed from the official SheetJS CDN tarball, not the stale npm version) or `exceljs` | For Screener exports and Excel EOD files |
 | CSV | `papaparse` | Streaming parse for large files |
+| NSE fetch | Node `fetch` (undici) + a small cookie jar (`tough-cookie`) + `fflate` (unzip) + `p-limit`/`p-retry` | Polite throttling, retries with backoff, browser-like headers |
 | Auth | **Auth.js** with Google provider, single allowed email | Controlled by `AUTH_MODE=none|google`; v1 default `none` |
 | Dates | `date-fns` + `date-fns-tz` (Asia/Kolkata) | |
 | Money math | Integer paise or `decimal.js` for ledger amounts; never float sums for balances | |
@@ -173,6 +174,7 @@ export default defineConfig({
       id: "settings", title: "Settings", icon: "Settings", page: "settings",
       children: [
         { id: "connections", title: "Connections", page: "settings/connections" },
+        { id: "market-data", title: "Market data", page: "settings/market-data" },
         // data, fundamentals, categories, preferences ...
       ],
     },
@@ -285,40 +287,130 @@ interface MarketStore {
 }
 interface SignalStore { write(date: string, results: ScanResults): Promise<void>; read(date?: string): Promise<ScanResults | undefined>; listDates(): Promise<string[]> }
 interface FundamentalsStore { list(): Promise<FundamentalsMeta[]>; get(symbol: string): Promise<Financials | undefined>; put(symbol: string, file: Buffer): Promise<void> }
-interface EodUpdater { run(onLog: (line: string) => void, signal: AbortSignal): Promise<{ ok: boolean; exitCode: number; durationMs: number }> }
+interface EodSource {                                       // where raw daily files come from (v1: NSE archives)
+  id: string;
+  isTradingDay(date: string): Promise<boolean | "unknown">;
+  fetchDay(date: string, signal: AbortSignal): Promise<DayBundle>; // equities + delivery + indices for one date
+  fetchCorporateActions(from: string, to: string): Promise<CorporateAction[]>;
+  fetchSymbolChanges(): Promise<SymbolChange[]>;
+  fetchSecurities(): Promise<Security[]>;
+}
+interface MarketWriter {                                    // only the pipeline writes
+  appendDay(bundle: DayBundle): Promise<{ symbolsUpdated: number; newSymbols: string[] }>; // idempotent
+  upsertCorporateActions(rows: CorporateAction[]): Promise<void>;
+  applySymbolChanges(rows: SymbolChange[]): Promise<void>;
+}
+interface EodPipeline {
+  update(opts: { onProgress: (e: PipelineEvent) => void; signal: AbortSignal }): Promise<PipelineResult>;            // incremental
+  backfill(opts: { from: string; to?: string; onProgress; signal }): Promise<PipelineResult>;                        // resumable
+  importLegacy(opts: { dir: string; mapping: LegacyMapping; onProgress; signal }): Promise<PipelineResult>;           // one-time
+  rebuildFromRaw(opts: { from?: string; to?: string; onProgress; signal }): Promise<PipelineResult>;                 // re-parse cached raw files
+}
 ```
 
 ### 5.2 v1 adapters (`src/data/market/local/`)
 
-- `LocalFileMarketStore`: reads the owner's files per `docs/DATA_CONTRACT.md`. Column mapping, date format, file pattern, and sheet name come from a typed **`eod` section in config or `.env.local`** (not hard-coded), e.g.
-
-  ```ts
-  eod: { dir: env.FINBOARD_EOD_DIR, pattern: "{symbol}.csv", format: "csv",
-         columns: { date: "Date", open: "Open", high: "High", low: "Low", close: "Close", volume: "Volume" },
-         dateFormat: "yyyy-MM-dd", adjusted: true }
-  ```
+- `LocalFileMarketStore` and `LocalFileMarketWriter`: read and write FinBoard's **canonical store** (§5.5.1) under `FINBOARD_DATA_DIR/market/`. The format is fixed and owned by FinBoard. Legacy formats are handled only by the importer.
 - In-memory LRU cache of parsed series keyed by `(path, mtimeMs, size)`; invalidated automatically after an update run.
-- Normalise: sort ascending, drop exact-duplicate dates (keep last), drop rows with non-positive prices, log anomalies once.
-- If data is not adjusted and a corporate-actions source exists, apply back-adjustment factors at read time (`adjusted: true` option); never rewrite files.
-- `LocalSignalStore`: `FINBOARD_DATA_DIR/signals/YYYY-MM-DD.json` (+ `latest.json` symlink/copy).
+- Normalise on read: drop rows with non-positive prices and log anomalies once. Sorting and dedupe are guaranteed by the writer.
+- **Adjustment happens at read time:** `getSeries(..., { adjusted: true })` applies cumulative split/bonus back-adjustment factors from `corporate_actions.csv` (price ÷ factor, volume × factor). Files always hold raw prices and are never rewritten for adjustments. Default is `adjusted: true` for charts and strategies, `false` for the journal/reconciliation views.
+- `LocalSignalStore`: `FINBOARD_DATA_DIR/signals/YYYY-MM-DD.json` (+ `latest.json` copy).
 - `LocalFundamentalsStore`: `FINBOARD_DATA_DIR/fundamentals/{SYMBOL}.xlsx` + parsed cache `fundamentals/.cache/{SYMBOL}.json` (invalidate on mtime).
-- `ScriptEodUpdater`: spawns the owner's command (`EOD_UPDATE_COMMAND`, `EOD_UPDATE_CWD` from `.env.local`) with `child_process.spawn` (no shell interpolation of user input), streams stdout/stderr lines, enforces a single concurrent run via a lock file, supports cancel. **Only enabled when `FINBOARD_MODE=local`.**
+- `NseArchiveSource` (`src/data/nse/`): implements `EodSource` (§5.5.3). Network access is enabled only when `FINBOARD_MODE=local` in v1.
 
 ### 5.3 Update flow
 
 1. User clicks **Update EOD** (top bar; also on Settings and Technical dashboard).
-2. `POST /api/eod/update` starts a job; `GET /api/eod/update/stream` is an **SSE** stream of `{ phase: "script" | "scan" | "broker-sync" | "snapshot", line?, progress?, done?, error? }`.
-3. Phase `script`: run `ScriptEodUpdater`. If it fails, stop and show the tail of the log.
+2. `POST /api/eod/update` starts a job (single concurrent job enforced with a lock file; cancel supported); `GET /api/eod/update/stream` is an **SSE** stream of `{ phase: "fetch" | "scan" | "broker-sync" | "snapshot", line?, progress?, done?, error? }`.
+3. Phase `fetch`: run `EodPipeline.update` (§5.5.4). Progress shows days pending/fetched/appended, rows per day, new listings, corporate actions found, and warnings. If a day fails after retries, stop at that day (later days are not appended out of order), keep everything already appended, and show the error with a "Retry" button. Data is published around 18:00–19:00 IST: if today's files aren't available yet, finish successfully with "Today's data not published yet".
 4. Phase `scan`: invalidate caches, compute shared precomputations (RS ratings, index series) once, then run **every strategy found in the config** over the universe → `SignalStore.write(lastDate, ...)`. Show per-strategy progress and hit counts. Parallelise over symbols with a bounded worker pool (`p-limit`); total should finish in seconds-to-a-minute for ~2,000 symbols.
 5. Phase `broker-sync`: run the broker sync engine (§8A.4) for every connection with a valid session; expired connections are skipped with a "Reconnect" notice (never fail the whole update).
 6. Phase `snapshot`: write a net-worth snapshot (section 8) and refresh mutual-fund NAVs (AMFI `NAVAll.txt`, public; tolerate failure).
 7. UI shows "Last updated: <date>, <time> IST" from the latest signals file.
 
-Also expose the same flow as CLI: `npm run eod:update` (script + scan + snapshot) and `npm run scan [-- --date YYYY-MM-DD --strategy abc]` (scan only).
+Also expose the same flow as CLI:
+- `npm run eod:update`: fetch, scan, broker sync and snapshot. Suitable for Windows Task Scheduler or cron, e.g. weekdays at 19:30 IST.
+- `npm run eod:backfill -- --from YYYY-MM-DD [--to YYYY-MM-DD]`
+- `npm run eod:import-legacy [-- --dry-run]`
+- `npm run eod:rebuild [-- --from --to]`
+- `npm run eod:verify`: integrity report (§5.5.6)
+- `npm run scan [-- --date YYYY-MM-DD --strategy abc]`: scan only
 
 ### 5.4 v2 seams (do not implement now; keep the seams)
 
-`BlobMarketStore`/`S3MarketStore`, Neon DB, `AUTH_MODE=google`, scheduled updater, DuckDB-based backtester calling `strategy.scan` on truncated series. Choose implementations via a factory in `src/data/index.ts` driven by env vars.
+`BlobMarketStore`/`S3MarketStore`, Neon DB, `AUTH_MODE=google`, scheduled updater, DuckDB-based backtester calling `strategy.scan` on truncated series. Choose implementations via a factory in `src/data/index.ts` driven by env vars. NSE often blocks cloud IP ranges, so in v2 the fetch step will likely stay on a home machine or another non-blocked runner that pushes into cloud storage. Keep `EodPipeline` independent of Next.js (plain TypeScript in `src/data/`, callable from CLI) so it can run anywhere.
+
+### 5.5 NSE EOD pipeline
+
+**Verify every URL, file name, column name and format cut-over date below on the owner's machine before coding** (§2.6). NSE changes these from time to time. Keep URL patterns and column maps in one file (`src/data/nse/sources.ts`), and give every parser fixture-based tests.
+
+#### 5.5.1 Canonical store layout (owned by FinBoard)
+```
+$FINBOARD_DATA_DIR/market/
+├─ eod/equity/RELIANCE.csv      date,series,open,high,low,close,last,prev_close,volume,turnover,trades,delivery_qty,delivery_pct,isin
+├─ eod/index/NIFTY 50.csv       date,open,high,low,close,volume,turnover,pe,pb,div_yield
+├─ meta/securities.csv          symbol,isin,name,series,listing_date,face_value,status
+├─ meta/corporate_actions.csv   symbol,ex_date,type(split|bonus|rights|dividend|other),ratio_from,ratio_to,amount,raw_subject,source
+├─ meta/corporate_actions.manual.csv   owner overrides (same columns; take precedence)
+├─ meta/symbol_changes.csv      old_symbol,new_symbol,effective_date
+├─ meta/holidays.csv            date,description,source
+├─ meta/universe.txt            one symbol per line (§2.5)
+├─ manifest.json                { schemaVersion, firstDate, lastDate, days: { "YYYY-MM-DD": { status, source, rows, fetchedAt, files[] } } }
+└─ raw/YYYY/MM/<original file names>   cached downloads (zip kept zipped), never modified
+```
+- Dates are ISO `YYYY-MM-DD` (IST trading date). Numbers are plain decimals with no thousands separators. Each file is append-only and sorted ascending with one row per date. Delivery columns can be empty.
+- Store **all equity series that represent cash-market trading in a stock**: EQ, BE, BZ, and SM/ST for SME companies. Make the series list configurable. If a stock moves between series, it stays in the same file and the `series` column records which one applied that day.
+- **Writer guarantees:** a row is appended only if its date is after the file's last date. Writing a date that already exists is a no-op when the values are the same and a logged conflict when they differ. Each file is written via a temp file + rename, or a locked append that ends with an fsync, so a crash never leaves a half-written row. Each day is marked `appended` in the manifest only after all of its files are written. After a crash, a day still marked `fetched` is simply re-applied, because appends are idempotent.
+
+#### 5.5.2 One-time legacy import
+- Reads `FINBOARD_LEGACY_EOD_DIR` using a `LegacyMapping` (file pattern, CSV/XLSX, sheet, column map, date format, adjusted yes/no) recorded in `docs/DATA_CONTRACT.md` and saved in settings. The originals are **read-only**.
+- Writes canonical files plus `meta/universe.txt` (all symbols found). `--dry-run` prints per-symbol row counts, date ranges and anomalies without writing anything.
+- **If legacy prices are already adjusted:** either un-adjust them using corporate actions, or import only the symbol list and date range and then backfill raw data from NSE for that range (recommended when possible, since it's cleaner). Ask the owner which to use.
+- After import, run a **cross-check** on a sample of symbols and dates against NSE bhavcopy (close within ±0.05). Report any mismatches.
+- The manifest records the imported date range with `source: "legacy"`. Days missing between the legacy last date and today are filled by the normal update.
+
+#### 5.5.3 `NseArchiveSource` — files and endpoints (verify; §2.6)
+| Data | Source (expected) | Use |
+|---|---|---|
+| CM bhavcopy, current format (**UDiFF**, roughly July 2024 onward) | `https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{YYYYMMDD}_F_0000.csv.zip` — columns like `TradDt, TckrSymb, SctySrs, ISIN, OpnPric, HghPric, LwPric, ClsPric, LastPric, PrvsClsgPric, TtlTradgVol, TtlTrfVal, TtlNbOfTxsExctd` | OHLCV for all symbols |
+| CM bhavcopy, legacy format (before the UDiFF cut-over) | `https://nsearchives.nseindia.com/content/historical/EQUITIES/{YYYY}/{MON}/cm{DD}{MON}{YYYY}bhav.csv.zip` — `SYMBOL, SERIES, OPEN, HIGH, LOW, CLOSE, LAST, PREVCLOSE, TOTTRDQTY, TOTTRDVAL, TIMESTAMP, TOTALTRADES, ISIN` | Backfill |
+| Full bhavcopy with delivery | `https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{DDMMYYYY}.csv` — includes `DELIV_QTY, DELIV_PER` (header names have leading spaces; trim) | Delivery % (merge on symbol+series) |
+| Delivery, older dates | `https://nsearchives.nseindia.com/archives/equities/mto/MTO_{DDMMYYYY}.DAT` (header lines, then records) | Delivery for backfill years where `sec_bhavdata_full` isn't available |
+| Index closes | `https://nsearchives.nseindia.com/content/indices/ind_close_all_{DDMMYYYY}.csv` — `Index Name, Index Date, Open Index Value, High…, Low…, Closing Index Value, …, Volume, Turnover (Rs. Cr.), P/E, P/B, Div Yield` | Index series (RS, beta, breadth, market valuation widget) |
+| Securities list | `https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv` (plus the SME list if needed) | Names, ISIN, listing dates, face value |
+| Symbol changes | `https://nsearchives.nseindia.com/content/equities/symbolchange.csv` | Rename handling |
+| Index constituents | `https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv` (and similar) | Industry, index-based universes, peers |
+| Corporate actions | NSE website JSON API (`https://www.nseindia.com/api/corporates-corporateActions?index=equities&from_date=DD-MM-YYYY&to_date=DD-MM-YYYY`), which needs a cookie session (below) | Split/bonus adjustment factors |
+| Trading holidays | NSE website JSON API (`https://www.nseindia.com/api/holiday-master?type=trading`), cookie session | Skip non-trading days |
+
+- **Parsers:** one parser per format (`udiff`, `legacy-cm`, `sec-full`, `mto`, `index-close`) with a format-detection step. Never rely on column positions; always use header names (trimmed, case-insensitive). The day's equity bundle uses UDiFF or legacy CM as the primary source, with delivery data merged in where available.
+- **HTTP client:** browser-like `User-Agent`, `Accept`, `Accept-Language` and `Referer: https://www.nseindia.com/` headers. For the `www.nseindia.com/api/*` endpoints, first load the NSE home page to get cookies and keep them in a cookie jar, refreshing on 401/403.
+  - Throttle to about 1 request per second with jitter, and retry with exponential backoff on 429, 5xx and network errors.
+  - Treat a 404 on a day missing from the holiday list as "not published yet" for today and as a "probable holiday" for past days. Confirm a past day only after retries, record it in `holidays.csv` with `source: "inferred"`, and surface it in the integrity report.
+  - Never send the owner's personal data (email, etc.) in requests.
+- **Corporate-action parsing:** turn subject strings into ratios with tested regexes, for example "Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 2/- Per Share" → split 10:2, and "Bonus 1:1" → bonus 1:1 (factor 2). Anything that can't be parsed goes to `type: other` with `raw_subject` kept and is shown in Settings for the owner to resolve in the manual overrides file.
+- **Split detection safety net:** if a stock's open is about 1/N of the previous close (N ≥ 1.5, within 3%) and there's no matching corporate action, raise a warning in the integrity report suggesting a manual override.
+- **Symbol changes:** when `symbolchange.csv` shows a rename, move `OLD.csv` history into `NEW.csv` (merge, keeping order), record the alias, and update `universe.txt`. Lookups by an old symbol resolve to the new one. ISIN is stored per row to help verify continuity.
+
+#### 5.5.4 Incremental update (`EodPipeline.update`)
+1. Load the manifest and refresh holidays (on failure, keep the cached holidays).
+2. Work out the pending dates: from `lastDate + 1` to today (IST), skipping weekends and holidays. Today is included only if it is after a configurable publish time (default 18:30 IST).
+3. For each pending date, in ascending order: download (or reuse from `raw/`) → parse → validate (§5.5.6) → `appendDay` → update the manifest. Stop at the first hard failure.
+4. Refresh corporate actions for the window `lastDate − 30d … today + 30d` and the securities, symbol-change and index-constituent lists (weekly is enough; cache the timestamp).
+5. Report new listings. Delisted symbols are marked `status: inactive` in `securities.csv` once they've been absent for 30 trading days.
+
+The typical daily run is about 3–5 requests and should finish in under 30 seconds plus the scan.
+
+#### 5.5.5 Backfill (`EodPipeline.backfill`)
+- `--from` can go as far back as NSE archives allow (the legacy CM bhavcopy goes back to the mid-1990s; verify). The range is chunked by month and is **resumable**: the manifest makes reruns skip finished days, and downloaded files are cached in `raw/`.
+- Prepending history into existing files must keep them sorted: write the older rows to a temp file, then merge with the existing file before renaming it into place. Do this per symbol, at the end of each chunk.
+- Throttle politely. A full multi-decade backfill can take hours, so the UI and CLI show an ETA and support pausing and resuming. Run it from the CLI or from Settings → Market data (with progress).
+- Also backfill index history (`ind_close_all`) and corporate actions for the same range.
+
+#### 5.5.6 Validation and integrity
+- **Per day:** row count within ±20% of the trailing 20-day median (otherwise warn; a hard fail below 50%), `low ≤ open, close ≤ high`, positive prices, no duplicate symbol+series, and the trade date inside the file matches the requested date.
+- **`eod:verify` report:** gaps in the manifest, files with out-of-order or duplicate dates, symbols with unexplained price jumps (split detector), legacy cross-check mismatches, inferred holidays, and unparsed corporate actions. Shown in Settings → Market data, with a "Re-fetch day" action for each problem day.
+- **Settings → Market data page:** first/last date, number of symbols, disk usage, last update result, pending days, a backfill control, legacy import status, and the integrity report.
 
 ---
 
@@ -603,7 +695,7 @@ Triggers: "Sync now" (per connection or all), automatically right after a succes
 
 ### 8A.5 Zerodha connector (`src/modules/brokers/zerodha/`) — first implementation
 **Verify every detail below against the current Kite Connect v3 docs (https://kite.trade/docs/connect/v3/) and the developer console before coding; the docs win if anything differs.**
-- **App setup (owner does once)**: create an app at developers.kite.trade. A personal-use plan with no market-data access is enough, because FinBoard only needs portfolio/order data (prices come from the owner's EOD files). Register the redirect URL `http://127.0.0.1:3000/api/brokers/zerodha/callback` (v2: the Vercel HTTPS URL). The owner enters `apiKey` and `apiSecret` in Settings → Connections; they're stored encrypted (§8A.6).
+- **App setup (owner does once)**: create an app at developers.kite.trade. A personal-use plan with no market-data access is enough, because FinBoard only needs portfolio/order data (prices come from FinBoard's own NSE EOD store). Register the redirect URL `http://127.0.0.1:3000/api/brokers/zerodha/callback` (v2: the Vercel HTTPS URL). The owner enters `apiKey` and `apiSecret` in Settings → Connections; they're stored encrypted (§8A.6).
 - **Auth (`oauth-redirect`, `sessionTtl: "daily"`)**: `begin` → `https://kite.zerodha.com/connect/login?v=3&api_key=<apiKey>`; callback receives `request_token` (+ `status=success`); `complete` → `POST https://api.kite.trade/session/token` with `api_key`, `request_token`, `checksum = SHA-256(api_key + request_token + api_secret)` → `access_token`. Requests use headers `X-Kite-Version: 3` and `Authorization: token <api_key>:<access_token>`. The token expires daily (early morning, next day) and has no refresh token, so the UI shows a one-click **"Reconnect Zerodha"** banner when expired. Verify the `state`/redirect params to prevent CSRF (store a nonce in a short-lived signed cookie and pass it via the `redirect_params` option).
 - **Endpoints used (allow-list)**: `GET /user/profile`, `GET /user/margins`, `GET /portfolio/holdings`, `GET /portfolio/positions`, `GET /orders`, `GET /trades`, `GET /mf/holdings`, `GET /mf/orders`, plus `POST /session/token` and `DELETE /session/token`. Use a thin typed `fetch` client (Zod-validated responses); the official `kiteconnect` npm SDK is acceptable only if wrapped so the allow-list is still enforced.
 - **Capabilities**: holdings, positions, funds, orders, `trades: { history: "today" }`, mfHoldings, `mfTransactions: { history: { maxDays: <per docs> } }`. Note that `/orders` and `/trades` return **only the current trading day**, so daily syncs (via the Update EOD flow) build history going forward.
@@ -636,7 +728,7 @@ The conformance suite then runs against it automatically; the Connections wizard
 
 - Layout: collapsible sidebar generated from the config (icons, nested groups, active state, breadcrumbs), top bar with global symbol search (universe + fundamentals + holdings), Update EOD button with status, theme toggle.
 - Indian formatting utilities in `src/lib/format.ts` (₹, lakh/crore compact formatting, `dd MMM yyyy` dates, IST). Green/red for gains/losses with colour-blind-safe alternative (also use ▲/▼).
-- Every page has loading skeletons, empty states with the next action ("Upload a Screener file", "Connect your broker", "Set FINBOARD_EOD_DIR"), and error states with actionable messages.
+- Every page has loading skeletons, empty states with the next action ("Upload a Screener file", "Connect your broker", "Import legacy data or run a backfill"), and error states with actionable messages.
 - Responsive down to 375 px width; tables scroll horizontally inside their container only.
 - Keyboard: `/` focuses search; `u` triggers update (with confirm).
 - A visible disclaimer on Research pages: signals and valuations are analytical tools, not investment advice.
@@ -648,11 +740,10 @@ The conformance suite then runs against it automatically; the Connections wizard
 `.env.example` (commit it; never commit `.env.local`):
 ```
 FINBOARD_MODE=local                 # local | cloud (v2)
-FINBOARD_EOD_DIR=/path/to/your/eod  # owner's existing data (read-only to FinBoard)
-FINBOARD_INDEX_DIR=                 # optional index data
-FINBOARD_DATA_DIR=/path/to/finboard-data   # signals, fundamentals, db, cache
-EOD_UPDATE_COMMAND="python update.py"
-EOD_UPDATE_CWD=/path/to/your/scripts
+FINBOARD_DATA_DIR=/path/to/finboard-data   # canonical market store, signals, fundamentals, db, cache
+FINBOARD_LEGACY_EOD_DIR=/path/to/your/old/eod   # owner's existing data; read-only, used only by eod:import-legacy
+NSE_PUBLISH_TIME=18:30              # IST; before this, today's EOD is treated as "not published yet"
+NSE_REQUESTS_PER_SECOND=1
 AUTH_MODE=none                      # none | google
 AUTH_SECRET=
 AUTH_GOOGLE_ID=
@@ -671,8 +762,10 @@ Validate env with Zod at startup (`src/env.ts`) and show a friendly setup screen
 
 - **Unit (Vitest)**: indicators (vs hand-computed fixtures), each strategy on synthetic series that should and should not trigger (≥ 2 positive and 2 negative cases each, including edge cases like insufficient lookback), look-ahead check (appending future bars must not change `scan` result on a truncated series), Screener parser (fixture), each valuation model (hand-worked example), XIRR, FIFO lot matching, bank import dedupe, config validation test (§4.2).
 - **Broker connectors**: conformance suite (§8A.2) for every configured connector using recorded fixtures (HTTP mocked with `msw` or `undici` MockAgent — no live broker calls in tests); Zerodha checksum/session exchange; endpoint allow-list (no order routes); API-vs-file dedupe (same trade imported both ways yields one row); sync idempotency (running sync twice changes nothing); expired-token handling marks the connection `expired`; coverage-gap detection; encryption round-trip and that secrets never appear in logs or client payloads.
+- **NSE pipeline**: each parser (UDiFF, legacy CM, sec_bhavdata_full, MTO, ind_close_all, EQUITY_L, symbolchange) against recorded fixtures; format detection; corporate-action subject parsing (table of real subject strings → ratios); adjustment factors (split + bonus on the same stock, multiple events); writer idempotency (appending the same day twice changes nothing; a conflicting re-append is reported); crash safety (a simulated failure mid-day leaves the manifest consistent and a rerun completes); out-of-order protection; backfill prepend-merge keeps files sorted; symbol rename merge; holiday/404 handling; validation thresholds. HTTP is mocked; **no live NSE calls in tests** (one opt-in script `npm run nse:smoke` hits the live archives for the owner to run manually).
+- **Legacy import**: dry-run report on fixture legacy files (CSV and XLSX variants), column mapping, and the cross-check.
 - **Parity test** for the owner's existing strategy: run the original script/logic and the port on the same fixture data; hit lists and key values must match exactly (document any intentional differences with the owner's approval).
-- **E2E smoke (Playwright)**: app boots with fixture data dir, sidebar renders from config, a strategy page lists hits, a fundamental page shows a fair value, Update EOD runs a fake script (fixture command) and streams logs.
+- **E2E smoke (Playwright)**: app boots with fixture data dir, sidebar renders from config, a strategy page lists hits, a fundamental page shows a fair value, Update EOD runs the pipeline against a mocked NSE source and streams progress.
 - **Extensibility test**: a test adds a dummy strategy node + module (in a temp config) and asserts it appears in the resolved nav, the technical dashboard card list, and the scan pipeline — without touching any other file.
 - `npm run lint && npm run typecheck && npm test && npm run build` must pass at the end of every phase.
 
@@ -681,7 +774,7 @@ Validate env with Zod at startup (`src/env.ts`) and show a friendly setup screen
 ## 12. Phases (commit after each; each lists acceptance criteria)
 
 1. **Foundation** — Next.js + TS strict + Tailwind + shadcn; `src/env.ts`; `finboard.config.ts` + `defineConfig` + resolver + catch-all route + sidebar/breadcrumbs from config; page registry with placeholder pages; PGlite + Drizzle schema + migrations; Auth.js wired behind `AUTH_MODE`; formatting utils. *Done when* every nav entry renders a placeholder and the config validation test passes.
-2. **Discovery + market data** — complete `docs/DATA_CONTRACT.md` with the owner; `LocalFileMarketStore` with configurable column mapping and caching; index loading; `ScriptEodUpdater` + SSE job API + Update EOD button with live log; symbol page with candle chart; CLI scripts. *Done when* the owner's real data loads and the button runs their script end-to-end.
+2. **Discovery + NSE EOD pipeline** — complete `docs/DATA_CONTRACT.md` with the owner (incl. live URL check from their machine); canonical store (`LocalFileMarketStore` + writer + manifest + read-time adjustment); `NseArchiveSource` with all parsers, cookie session, throttling, holidays, corporate actions, symbol changes; one-time legacy import with dry run and cross-check; incremental update, backfill, rebuild-from-raw and verify; SSE job API + Update EOD button with live progress; Settings → Market data page; symbol page with candle chart; CLI scripts. *Done when* the owner's legacy data is imported, `eod:update` fills every day from the legacy last date to the latest published day, `eod:verify` reports no unexplained gaps, and adjusted charts look continuous across a known split (e.g. a recent large-cap split).
 3. **Technical** — indicator library; `defineStrategy`; scan pipeline + RS rating + `SignalStore`; `StrategyPage` + chart drawer + presets; ABC, 44 MA, SEPA, VCP, Darvas, and the owner's strategy (with parity test); `TechnicalDashboard`; extensibility test. *Done when* a fresh scan over the full universe produces signals and every strategy page shows hits with overlays.
 4. **Fundamental** — Screener upload + parser + derived metrics; `defineValuationModel`; all models; `ApproachPage` ×3; `FundamentalDashboard` with football-field chart. *Done when* uploading a fixture file yields fair values in all three approaches.
 5. **Brokers + Investments** — `defineBroker` + canonical models + conformance suite; encryption; Connections UI and wizard; sync engine with coverage tracking; Zerodha connector (Kite Connect OAuth, holdings/positions/funds/orders/trades/MF) with Console file importers for history; `broker-sync` phase in Update EOD; reconciliation; FIFO holdings; XIRR; MF via AMFI; FD/PPF/EPF/NPS/other assets; Overview page. *Done when* the owner connects Zerodha, a sync populates holdings that reconcile with the broker snapshot, a one-time Console tradebook import back-fills history without duplicates, and a dummy second broker added via the two-step pattern passes the conformance suite.
@@ -713,4 +806,4 @@ Result: new sidebar entry, page at `/research/technical/my-strategy`, card on th
 
 ## 14. Out of scope for v1
 
-NSE data downloading/backfill (owner's script handles it), backtesting engine, live/intraday quotes, any order placement or trading through broker APIs (FinBoard is read-only), broker market-data/historical-candle APIs, broker postback webhooks (need a public URL; consider in v2), connectors other than Zerodha (the framework must support them), multi-user support, mobile app, notifications by email/push, cloud deployment. Keep the seams described in §5.4 so these can be added later.
+backtesting engine, BSE data, intraday/minute data, live/intraday quotes, any order placement or trading through broker APIs (FinBoard is read-only), broker market-data/historical-candle APIs, broker postback webhooks (need a public URL; consider in v2), connectors other than Zerodha (the framework must support them), multi-user support, mobile app, notifications by email/push, cloud deployment. Keep the seams described in §5.4 so these can be added later.
